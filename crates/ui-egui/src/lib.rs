@@ -369,6 +369,20 @@ pub struct PageClip {
 /// Files delivered asynchronously: (name, bytes).
 pub type Inbox = std::sync::Arc<std::sync::Mutex<Vec<(String, Vec<u8>)>>>;
 
+/// A file an embedding page sent in (the web build's `?host=parent` bridge), with the view
+/// options to apply to it once it is open.
+#[derive(Clone, Debug, Default)]
+pub struct HostOpen {
+    pub name: String,
+    pub bytes: Vec<u8>,
+    /// `(key, value)` pairs for [`PdfCraftApp::set_option`], in order. The embedder is expected to
+    /// pass only the keys it allows; an option that fails is logged and skipped.
+    pub options: Vec<(String, String)>,
+}
+
+/// Files from an embedding page, opened like the startup download (see [`HostOpen`]).
+pub type HostInbox = std::sync::Arc<std::sync::Mutex<Vec<HostOpen>>>;
+
 /// Files that failed to arrive asynchronously (a browser `?file=` URL that couldn't be fetched):
 /// `(name, error)`, reported to the user on the next frame (#173).
 pub type FailedInbox = std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>;
@@ -592,6 +606,8 @@ pub struct PdfCraftApp {
     /// arrival opens in the background once the user has started working (#171).
     pub startup_inbox: Inbox,
     startup_superseded: bool,
+    /// Files from an embedding page with their view options. They open like `startup_inbox`.
+    pub host_inbox: HostInbox,
     /// Asynchronous opens that failed (web `?file=` fetches), shown as a notice.
     pub failed_inbox: FailedInbox,
     /// Mirrors "some document has unsaved work" each frame, so the web page's `beforeunload` handler can read it (#812).
@@ -930,6 +946,7 @@ impl PdfCraftApp {
             inbox: Default::default(),
             startup_inbox: Default::default(),
             startup_superseded: false,
+            host_inbox: Default::default(),
             failed_inbox: Default::default(),
             unsaved_flag: Default::default(),
             os_events: None,
@@ -2294,6 +2311,29 @@ impl PdfCraftApp {
         self.views.iter().any(|v| v.render_pending())
     }
 
+    /// Apply an embedding page's options to the document it just opened, which is the last view
+    /// whether it opened in front or in the background. Nothing is applied while the document
+    /// still waits for its password, or when it didn't open.
+    fn apply_host_options(&mut self, views_before: usize, name: &str, options: &[(String, String)]) {
+        if options.is_empty() {
+            return;
+        }
+        let opened = self.views.len().checked_sub(1).filter(|&last| last >= views_before);
+        let Some(opened) = opened.filter(|_| self.password_prompt.is_none()) else {
+            log::info!("{name}: view options skipped, the document isn't open yet");
+            return;
+        };
+        let active = self.active;
+        self.active = Some(opened);
+        for (key, value) in options {
+            if let Err(e) = self.set_option(key, value) {
+                log::warn!("{name}: option {key}={value}: {e}");
+            }
+        }
+        // A document that opened in the background stays there.
+        self.active = active;
+    }
+
     /// Apply a named view option (`--page 3`, `--panel bookmarks`, `--theme dark`, …).
     ///
     /// This is the seed of the UI control channel (M3.9): the same verbs become `ui.set` calls.
@@ -2402,7 +2442,11 @@ impl PdfCraftApp {
                 self.palette_query = value.to_string();
             }
             ("page", Some(v)) => v.go_to_page(value.parse::<usize>().map_err(|e| e.to_string())?.saturating_sub(1)),
-            ("zoom", Some(v)) => v.set_zoom(value.trim_end_matches('%').parse::<f32>().map_err(|e| e.to_string())? / 100.0),
+            ("zoom", Some(v)) => match value.trim() {
+                fit if fit.eq_ignore_ascii_case("fit-width") => v.set_fit(canvas::Fit::Width),
+                fit if fit.eq_ignore_ascii_case("fit-page") => v.set_fit(canvas::Fit::Page),
+                percent => v.set_zoom(percent.trim_end_matches('%').parse::<f32>().map_err(|e| e.to_string())? / 100.0),
+            },
             ("layout", Some(v)) => {
                 let (layout, continuous) = canvas::parse_display_token(value).ok_or("layout must be single, continuous, two-up or two-page")?;
                 v.set_display(layout, continuous);
@@ -2819,6 +2863,26 @@ impl eframe::App for PdfCraftApp {
                 if let Err(e) = self.open_bytes_with_focus(&name, None, bytes, activate) {
                     self.notify_fmt("Couldn't open {name}: {e}", &[("name", &name), ("e", &e)]);
                 }
+            }
+            let mut host: std::collections::VecDeque<HostOpen> =
+                self.host_inbox.lock().map(|mut q| std::mem::take(&mut *q)).unwrap_or_default().into();
+            // A file that asks for its password holds back the ones after it, so no prompt is replaced.
+            while self.password_prompt.is_none()
+                && let Some(open) = host.pop_front()
+            {
+                let activate = !self.startup_superseded;
+                let before = self.views.len();
+                match self.open_bytes_with_focus(&open.name, None, open.bytes, activate) {
+                    Ok(()) => self.apply_host_options(before, &open.name, &open.options),
+                    Err(e) => self.notify_fmt("Couldn't open {name}: {e}", &[("name", &open.name), ("e", &e)]),
+                }
+            }
+            if !host.is_empty()
+                && let Ok(mut q) = self.host_inbox.lock()
+            {
+                let arrived = std::mem::take(&mut *q);
+                q.extend(host);
+                q.extend(arrived);
             }
         }
         let failed: Vec<(String, String)> = self.failed_inbox.lock().map(|mut q| std::mem::take(&mut *q)).unwrap_or_default();
