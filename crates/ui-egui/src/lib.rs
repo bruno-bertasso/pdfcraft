@@ -91,7 +91,7 @@ use dialogs::protect;
 use dialogs::standards_ui;
 use dialogs::word_count_ui;
 pub use home::folders_ui;
-pub use hooks::{FailedInbox, HostDirtyFn, HostSaveFn, Inbox, OsEvent, OsEventsFn};
+pub use hooks::{FailedInbox, HostDirtyFn, HostInbox, HostOpen, HostSaveFn, Inbox, OsEvent, OsEventsFn};
 use menus::tab_context;
 use panels::all_tools_ui;
 use panels::comments_panel;
@@ -380,6 +380,8 @@ pub struct PdfCraftApp {
     /// arrival opens in the background once the user has started working (#171).
     pub startup_inbox: Inbox,
     startup_superseded: bool,
+    /// Files from an embedding page with their view options. They open like `startup_inbox`.
+    pub host_inbox: HostInbox,
     /// Asynchronous opens that failed (web `?file=` fetches), shown as a notice.
     pub failed_inbox: FailedInbox,
     /// Mirrors "some document has unsaved work" each frame, so the web page's `beforeunload` handler can read it (#812).

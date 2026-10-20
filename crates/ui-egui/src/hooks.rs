@@ -1,6 +1,20 @@
 /// Files delivered asynchronously: (name, bytes).
 pub type Inbox = std::sync::Arc<std::sync::Mutex<Vec<(String, Vec<u8>)>>>;
 
+/// A file an embedding page sent in (the web build's `?host=parent` bridge), with the view
+/// options to apply to it once it is open.
+#[derive(Clone, Debug, Default)]
+pub struct HostOpen {
+    pub name: String,
+    pub bytes: Vec<u8>,
+    /// `(key, value)` pairs for [`crate::PdfCraftApp::set_option`], in order. The embedder is
+    /// expected to pass only the keys it allows; an option that fails is logged and skipped.
+    pub options: Vec<(String, String)>,
+}
+
+/// Files from an embedding page, opened like the startup download (see [`HostOpen`]).
+pub type HostInbox = std::sync::Arc<std::sync::Mutex<Vec<HostOpen>>>;
+
 /// Files that failed to arrive asynchronously (a browser `?file=` URL that couldn't be fetched):
 /// `(name, error)`, reported to the user on the next frame (#173).
 pub type FailedInbox = std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>;

@@ -3,6 +3,10 @@
 
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+// Only the wasm build embeds; the native build compiles it for its tests.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+mod view_options;
+
 #[cfg(target_arch = "wasm32")]
 fn main() {
     use eframe::wasm_bindgen::JsCast;
@@ -66,7 +70,16 @@ fn main() {
                         {
                             app.comment_prefs.author = author.chars().take(200).collect();
                         }
-                        bridge.listen(app.startup_inbox.clone(), cc.egui_ctx.clone());
+                        // `?mode=`, `?zoom=`, `?page=`: view options for every file the host opens
+                        // (`view_options`); a `pdfcraft:open` message can override each one.
+                        let options = view_options::KEYS
+                            .iter()
+                            .filter_map(|&key| {
+                                let value = query_param(key)?;
+                                view_options::normalize(key, view_options::Raw::Text(&value)).map(|v| (key, v))
+                            })
+                            .collect();
+                        bridge.listen(app.host_inbox.clone(), options, cc.egui_ctx.clone());
                         app.host_save = Some(bridge.save_fn());
                         app.host_dirty = Some(bridge.dirty_fn());
                         bridge.post_ready();
@@ -127,8 +140,12 @@ async fn fetch_bytes(url: &str) -> Result<Vec<u8>, String> {
 /// `type`:
 ///
 /// - `pdfcraft:ready` (to the parent): the app is listening; send files now.
-/// - `pdfcraft:open` (from the parent): `{ name, bytes }`, where `bytes` is an `ArrayBuffer` or
-///   `Uint8Array` holding a PDF. It opens in a tab, like a `?file=` URL.
+/// - `pdfcraft:open` (from the parent): `{ name, bytes, mode?, zoom?, page? }`, where `bytes` is
+///   an `ArrayBuffer` or `Uint8Array` holding a PDF. It opens in a tab, like a `?file=` URL.
+///   `mode` (`all`, `read`, `edit`, `convert`, `sign`), `zoom` (`fit-width`, `fit-page` or a
+///   percentage from 8 to 6400) and `page` (1-based) are strings or numbers applied once the file
+///   is open; each overrides the `?mode=`, `?zoom=` or `?page=` query parameter of the frame. An
+///   invalid value is ignored (`view_options`).
 /// - `pdfcraft:save` (to the parent): `{ name, saveAs, bytes }` when the user saves; `bytes` is
 ///   a transferred `ArrayBuffer`. The parent stores the file (and reports its own errors).
 /// - `pdfcraft:dirty` (to the parent): `{ dirty }` whenever unsaved work appears or goes away.
@@ -186,8 +203,9 @@ mod host {
             }
         }
 
-        /// Hear `pdfcraft:open` from the parent and queue the file like a `?file=` download.
-        pub fn listen(&self, inbox: pdfcraft_ui_egui::Inbox, ctx: egui::Context) {
+        /// Hear `pdfcraft:open` from the parent and queue the file like a `?file=` download, with
+        /// the view options of the message over those of the query string (`query`).
+        pub fn listen(&self, inbox: pdfcraft_ui_egui::HostInbox, query: Vec<(&'static str, String)>, ctx: egui::Context) {
             let parent = self.parent.clone();
             let origin = self.origin.clone();
             let on_message = Closure::<dyn FnMut(web_sys::MessageEvent)>::new(move |event: web_sys::MessageEvent| {
@@ -207,8 +225,9 @@ mod host {
                 } else {
                     return;
                 };
+                let options = crate::view_options::merge(&query, &message_options(&data));
                 if let Ok(mut q) = inbox.lock() {
-                    q.push((name, bytes));
+                    q.push(pdfcraft_ui_egui::HostOpen { name, bytes, options });
                 }
                 ctx.request_repaint();
             });
@@ -249,6 +268,26 @@ mod host {
             js_sys::Reflect::set(&m, &JsValue::from_str(key), value).ok()?;
         }
         Some(m)
+    }
+
+    /// The valid view options of a `pdfcraft:open` message.
+    fn message_options(data: &JsValue) -> Vec<(&'static str, String)> {
+        use crate::view_options::{KEYS, Raw, normalize};
+        KEYS.iter()
+            .filter_map(|&key| {
+                let value = js_sys::Reflect::get(data, &JsValue::from_str(key)).ok()?;
+                // Don't copy a huge string out of the message only to refuse it.
+                if value.dyn_ref::<js_sys::JsString>().is_some_and(|s| s.length() > 64) {
+                    return None;
+                }
+                let normalized = match (value.as_string(), value.as_f64()) {
+                    (Some(text), _) => normalize(key, Raw::Text(&text)),
+                    (None, Some(number)) => normalize(key, Raw::Number(number)),
+                    (None, None) => None,
+                };
+                normalized.map(|v| (key, v))
+            })
+            .collect()
     }
 
     fn string(data: &JsValue, key: &str) -> Option<String> {

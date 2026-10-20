@@ -10,6 +10,29 @@ impl PdfCraftApp {
         client
     }
 
+    /// Apply an embedding page's options to the document it just opened, which is the last view
+    /// whether it opened in front or in the background. Nothing is applied while the document
+    /// still waits for its password, or when it didn't open.
+    pub(crate) fn apply_host_options(&mut self, views_before: usize, name: &str, options: &[(String, String)]) {
+        if options.is_empty() {
+            return;
+        }
+        let opened = self.views.len().checked_sub(1).filter(|&last| last >= views_before);
+        let Some(opened) = opened.filter(|_| self.password_prompt.is_none()) else {
+            log::info!("{name}: view options skipped, the document isn't open yet");
+            return;
+        };
+        let active = self.active;
+        self.active = Some(opened);
+        for (key, value) in options {
+            if let Err(e) = self.set_option(key, value) {
+                log::warn!("{name}: option {key}={value}: {e}");
+            }
+        }
+        // A document that opened in the background stays there.
+        self.active = active;
+    }
+
     /// Apply a named view option (`--page 3`, `--panel bookmarks`, `--theme dark`, …).
     ///
     /// This is the seed of the UI control channel (M3.9): the same verbs become `ui.set` calls.
@@ -134,7 +157,11 @@ impl PdfCraftApp {
                 self.palette_query = value.to_string();
             }
             ("page", Some(v)) => v.go_to_page(value.parse::<usize>().map_err(|e| e.to_string())?.saturating_sub(1)),
-            ("zoom", Some(v)) => v.set_zoom(DocView::parse_zoom_percent(value).ok_or("zoom must be a percentage above 0")?),
+            ("zoom", Some(v)) => match value.trim() {
+                fit if fit.eq_ignore_ascii_case("fit-width") => v.set_fit(canvas::Fit::Width),
+                fit if fit.eq_ignore_ascii_case("fit-page") => v.set_fit(canvas::Fit::Page),
+                percent => v.set_zoom(DocView::parse_zoom_percent(percent).ok_or("zoom must be fit-width, fit-page or a percentage above 0")?),
+            },
             ("layout", Some(v)) => {
                 let (layout, continuous) = canvas::parse_display_token(value).ok_or("layout must be single, continuous, two-up or two-page")?;
                 v.set_display(layout, continuous);

@@ -670,6 +670,65 @@ fn a_broken_late_startup_file_reports_its_error_without_changing_the_active_docu
     assert!(h.state().startup_inbox.lock().unwrap().is_empty());
 }
 
+fn deliver_host(h: &Harness<'static, PdfCraftApp>, name: &str, bytes: Vec<u8>, options: &[(&str, &str)]) {
+    let options = options.iter().map(|(k, v)| ((*k).to_string(), (*v).to_string())).collect();
+    h.state().host_inbox.lock().unwrap().push(pdfcraft_ui_egui::HostOpen { name: name.into(), bytes, options });
+}
+
+/// An embedding page's `mode`, `zoom` and `page` apply to the file once it is open, on every open.
+#[test]
+fn a_host_file_opens_with_its_view_options() {
+    use pdfcraft_ui_egui::{Mode, canvas::Fit};
+    let mut h = harness(&[]);
+    deliver_host(&h, "first.pdf", fixture(5), &[("mode", "read"), ("zoom", "200"), ("page", "3")]);
+    h.run_steps(2);
+    assert!(h.state().host_inbox.lock().unwrap().is_empty());
+    assert_eq!(h.state().active, Some(0));
+    assert_eq!(h.state().mode, Mode::Read);
+    assert_eq!((h.state().views[0].current, h.state().views[0].zoom, h.state().views[0].fit), (2, 2.0, Fit::None));
+
+    // A later file opens in the background (#583) and still gets its options; the first keeps its own.
+    deliver_host(&h, "second.pdf", fixture(4), &[("zoom", "fit-page"), ("page", "99")]);
+    h.run_steps(2);
+    assert_eq!(h.state().views.len(), 2);
+    assert_eq!(h.state().active, Some(0), "the open document stays in front");
+    assert_eq!((h.state().views[1].current, h.state().views[1].fit), (3, Fit::Page), "past the end lands on the last page");
+    assert_eq!((h.state().views[0].current, h.state().views[0].zoom), (2, 2.0));
+}
+
+/// An option `set_option` refuses is skipped; the file still opens and the other options apply.
+#[test]
+fn a_host_files_bad_option_is_skipped() {
+    let mut h = harness(&[]);
+    deliver_host(&h, "doc.pdf", fixture(3), &[("zoom", "huge"), ("page", "not-a-number"), ("nonsense", "1"), ("page", "2")]);
+    h.run_steps(2);
+    assert_eq!(h.state().views.len(), 1);
+    assert_eq!(h.state().views[0].current, 1);
+    assert!(h.state().toast.is_none(), "{:?}", h.state().toast);
+}
+
+/// A host file that asks for its password skips its options and holds back the files after it,
+/// which open once the prompt is answered; a broken one is reported.
+#[test]
+fn a_host_file_that_cannot_open_yet_skips_its_options() {
+    let mut h = harness(&[]);
+    deliver_host(&h, "locked.pdf", encrypted_fixture(), &[("page", "1")]);
+    deliver_host(&h, "next.pdf", fixture(3), &[("page", "2")]);
+    h.run_steps(2);
+    assert_eq!(h.state().password_prompt.as_ref().unwrap().name, "locked.pdf");
+    assert!(h.state().views.is_empty());
+    assert_eq!(h.state().host_inbox.lock().unwrap().len(), 1, "the next file waits for the prompt");
+    h.state_mut().submit_password(None);
+    h.run_steps(2);
+    assert_eq!(h.state().views.len(), 1);
+    assert_eq!(h.state().views[0].current, 1, "the next file gets its own options");
+    deliver_host(&h, "broken.pdf", b"not a PDF".to_vec(), &[("page", "3")]);
+    h.run_steps(2);
+    assert_eq!(h.state().views.len(), 1);
+    assert_eq!(h.state().views[0].current, 1, "a file that didn't open applies nothing");
+    assert!(h.state().toast.as_ref().unwrap().0.contains("broken.pdf"));
+}
+
 fn encrypted_fixture() -> Vec<u8> {
     use pdfcraft_engine::{Edit, Protection, Session};
     let mut s = Session::new();

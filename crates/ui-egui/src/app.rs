@@ -116,6 +116,7 @@ impl PdfCraftApp {
             inbox: Default::default(),
             startup_inbox: Default::default(),
             startup_superseded: false,
+            host_inbox: Default::default(),
             failed_inbox: Default::default(),
             unsaved_flag: Default::default(),
             os_events: None,
@@ -427,6 +428,26 @@ impl eframe::App for PdfCraftApp {
                 if let Err(e) = self.open_bytes_with_focus(&name, None, bytes, activate) {
                     self.notify_fmt("Couldn't open {name}: {e}", &[("name", &name), ("e", &e)]);
                 }
+            }
+            let mut host: std::collections::VecDeque<HostOpen> =
+                self.host_inbox.lock().map(|mut q| std::mem::take(&mut *q)).unwrap_or_default().into();
+            // A file that asks for its password holds back the ones after it, so no prompt is replaced.
+            while self.password_prompt.is_none()
+                && let Some(open) = host.pop_front()
+            {
+                let activate = !self.startup_superseded;
+                let before = self.views.len();
+                match self.open_bytes_with_focus(&open.name, None, open.bytes, activate) {
+                    Ok(()) => self.apply_host_options(before, &open.name, &open.options),
+                    Err(e) => self.notify_fmt("Couldn't open {name}: {e}", &[("name", &open.name), ("e", &e)]),
+                }
+            }
+            if !host.is_empty()
+                && let Ok(mut q) = self.host_inbox.lock()
+            {
+                let arrived = std::mem::take(&mut *q);
+                q.extend(host);
+                q.extend(arrived);
             }
         }
         let failed: Vec<(String, String)> = self.failed_inbox.lock().map(|mut q| std::mem::take(&mut *q)).unwrap_or_default();
